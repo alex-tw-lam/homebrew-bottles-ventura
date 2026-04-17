@@ -87,9 +87,7 @@ jobs:
 
           [ ${#needs_compile[@]} -eq 0 ] && { echo "detected=" >> "$GITHUB_OUTPUT"; exit 0; }
 
-          # Topological sort: deps first
           ordered=$(brew deps --topological "${needs_compile[@]}" 2>/dev/null || printf '%s\n' "${needs_compile[@]}")
-          # Keep only packages needing compilation, in correct order
           final=()
           while IFS= read -r pkg; do
             for nc in "${needs_compile[@]}"; do
@@ -104,8 +102,6 @@ jobs:
 
           echo "Building: ${final[*]}"
           printf 'detected=%s\n' "$(printf '%s ' "${final[@]}")" >> "$GITHUB_OUTPUT"
-        outputs:
-          detected: ${{ steps.detect.outputs.detected }}
 
       - name: Build bottles
         if: inputs.detect_mode && steps.detect.outputs.detected != '' || !inputs.detect_mode && inputs.packages != ''
@@ -119,7 +115,6 @@ jobs:
           for pkg in $PACKAGES; do
             echo "::group::$pkg"
 
-            # V11: Disk space
             free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
             echo "Disk: ${free_gb}GB free"
             if [ "$free_gb" -lt 5 ]; then
@@ -130,9 +125,6 @@ jobs:
 
             start=$(date +%s)
 
-            # Build — write to log file to avoid 10min GitHub Actions timeout
-            # (piping to tail suppresses output, causing auto-kill)
-            # Ensure package not already installed from previous run
             brew uninstall --ignore-dependencies "$pkg" 2>/dev/null || true
 
             build_log="/tmp/brew-build-${pkg}.log"
@@ -144,15 +136,12 @@ jobs:
             rm -f "$build_log"
             [ "$build_exit" -ne 0 ] && { echo "::error::brew install failed for $pkg (exit $build_exit)"; exit 1; }
 
-            # Bottle
             brew bottle --verbose --json "$pkg" 2>&1
 
-            # V5: Verify files exist
             tarball=$(ls ${pkg}--*.ventura.bottle.tar.gz 2>/dev/null | head -1 || true)
             jsonfile=$(ls ${pkg}--*.ventura.bottle.json 2>/dev/null | head -1 || true)
             [ -s "$tarball" ] || { echo "::error::No bottle tarball for $pkg"; exit 1; }
 
-            # V6a: Checksum
             checksum=$(shasum -a 256 "$tarball" | awk '{print $1}')
             size=$(du -h "$tarball" | awk '{print $1}')
             duration=$(($(date +%s) - start))
@@ -161,7 +150,6 @@ jobs:
             mv "$tarball" bottles/
             [ -n "$jsonfile" ] && [ -s "$jsonfile" ] && mv "$jsonfile" bottles/
 
-            # Update manifest
             python3 << PYEOF
 import json
 m = json.load(open('bottles/build-manifest.json'))
