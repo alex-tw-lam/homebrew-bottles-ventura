@@ -1,0 +1,29 @@
+name: Test Install Bottles
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run ID of the build to test installing'
+        required: true
+
+jobs:
+  test_install:
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Test install-bottles.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Simulating old macOS environment..."
+          # Tell Homebrew to ignore OS requirements during install to simulate what we hope happens
+          export HOMEBREW_DEVELOPER=1
+          
+          # Run the installer script with the provided run ID
+          ./scripts/install-bottles.sh ${{ inputs.run_id }} alex-tw-lam/homebrew-bottles-ventura
+          
+          echo "Verifying installation..."
+          tree --version
