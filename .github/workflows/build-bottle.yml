@@ -102,8 +102,8 @@ jobs:
 
             brew bottle --verbose --json "$pkg" 2>&1
 
-            tarball=$(ls ${pkg}--*.bottle.tar.gz 2>/dev/null | head -1 || true)
-            jsonfile=$(ls ${pkg}--*.bottle.json 2>/dev/null | head -1 || true)
+            tarball=$(ls ${pkg}--*.bottle*.tar.gz 2>/dev/null | head -1 || true)
+            jsonfile=$(ls ${pkg}--*.bottle*.json 2>/dev/null | head -1 || true)
             [ -s "$tarball" ] || { echo "::error::No bottle tarball for $pkg"; exit 1; }
 
             # Rename to ventura tag so it's clear what OS it targets
