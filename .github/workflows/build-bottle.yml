@@ -102,15 +102,18 @@ jobs:
 
             brew bottle --verbose --json "$pkg" 2>&1
 
-            tarball=$(ls ${pkg}--*.bottle*.tar.gz 2>/dev/null | head -1 || true)
-            jsonfile=$(ls ${pkg}--*.bottle*.json 2>/dev/null | head -1 || true)
+            tarball=$(find . -name "${pkg}--*.bottle*.tar.gz" | head -n 1)
+            jsonfile=$(find . -name "${pkg}--*.bottle*.json" | head -n 1)
             [ -s "$tarball" ] || { echo "::error::No bottle tarball for $pkg"; exit 1; }
 
             # Rename to ventura tag so it's clear what OS it targets
-            new_tarball=$(echo "$tarball" | sed 's/\.bottle\.tar\.gz/.ventura.bottle.tar.gz/')
-            new_jsonfile=$(echo "$jsonfile" | sed 's/\.bottle\.json/.ventura.bottle.json/')
-            mv "$tarball" "bottles/$new_tarball"
-            [ -n "$jsonfile" ] && [ -s "$jsonfile" ] && mv "$jsonfile" "bottles/$new_jsonfile"
+            new_tarball="bottles/$(basename "$tarball" | sed 's/\(\.bottle\..*\.tar\.gz\)/.ventura\1/')"
+            mv "$tarball" "$new_tarball"
+
+            if [ -n "$jsonfile" ] && [ -s "$jsonfile" ]; then
+                new_jsonfile="bottles/$(basename "$jsonfile" | sed 's/\(\.bottle\..*\.json\)/.ventura\1/')"
+                mv "$jsonfile" "$new_jsonfile"
+            fi
 
             # Checksum
             checksum=$(shasum -a 256 "bottles/$new_tarball" | awk '{print $1}')
@@ -144,4 +147,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bottles-${{ github.run_id }}
-          path: bottles/*.ventura.bottle.*
+          path: bottles/*.ventura.bottle.tar.gz
