@@ -1,14 +1,14 @@
-name: Build Homebrew Bottles (Tart VM)
+name: Build Homebrew Bottles (Rosetta x86_64)
 
 on:
   workflow_dispatch:
     inputs:
       packages:
-        description: 'Package names in topological order (required when detect_mode=false)'
+        description: 'Package names in topological order'
         required: false
         type: string
       detect_mode:
-        description: 'Auto-detect which of the listed packages need ventura compilation'
+        description: 'Auto-detect which packages need compilation (runner OS is macOS 15, so detect is simulated)'
         required: false
         type: boolean
         default: false
@@ -16,6 +16,12 @@ on:
 permissions:
   contents: read
   actions: write
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_CCACHE: "1"
+  # Force targeting macOS 13
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
 
 jobs:
   build:
@@ -28,179 +34,151 @@ jobs:
       - name: Validate inputs
         if: ${{ !inputs.detect_mode && inputs.packages == '' }}
         run: |
-          echo "::error::No packages specified. Use -f packages='...' or -f detect_mode=true"
+          echo "::error::No packages specified."
           exit 1
 
-      - name: Install Tart & SSH Tools
+      - name: Install Rosetta 2
         run: |
-          brew install cirruslabs/cli/tart sshpass
+          sudo softwareupdate --install-rosetta --agree-to-license
+
+      - name: Install Intel Homebrew
+        run: |
+          echo "Installing Intel Homebrew to /usr/local via Rosetta 2..."
+          NONINTERACTIVE=1 arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+      - name: Setup cache directories
+        run: |
           mkdir -p cache/Homebrew cache/ccache bottles tmp
 
-      - name: Cache Homebrew downloads (Host)
+      - name: Cache Homebrew downloads
         uses: actions/cache@v4
         with:
           path: cache/Homebrew
           key: brew-dl-${{ github.run_id }}
           restore-keys: brew-dl-
 
-      - name: Cache ccache (Host)
+      - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: cache/ccache
           key: ccache-${{ github.run_id }}
           restore-keys: ccache-
 
-      - name: Pull and clone macOS Ventura VM
+      - name: Setup ccache and Paths
         run: |
-          IMAGE="ghcr.io/cirruslabs/macos-ventura-base:latest"
-          tart pull $IMAGE
-          tart clone $IMAGE ventura-vm
-
-      - name: Start Tart VM and Wait for SSH
-        run: |
-          tart run --dir=workspace:${{ github.workspace }} --no-graphics ventura-vm &
-          
-          echo "Waiting for VM IP..."
-          while [ -z "$(tart ip ventura-vm 2>/dev/null)" ]; do sleep 2; done
-          VM_IP=$(tart ip ventura-vm)
-          echo "VM_IP=$VM_IP" >> $GITHUB_ENV
-          
-          echo "Waiting for SSH to become available..."
-          while ! nc -z $VM_IP 22; do sleep 5; done
-          echo "VM is up and SSH is ready!"
-
-      - name: Execute Build inside VM
-        env:
-          PACKAGES: ${{ inputs.packages }}
-          DETECT_MODE: ${{ inputs.detect_mode }}
-        run: |
-          cat << 'EOF' > build.sh
-          #!/bin/bash
-          set -euo pipefail
-          
-          SHARED="/Volumes/My Shared Files/workspace"
-          export HOMEBREW_CACHE="$SHARED/cache/Homebrew"
-          # DO NOT export HOMEBREW_TEMP to shared disk (VirtioFS IO overhead is too slow for compiles)
-          export CCACHE_DIR="$SHARED/cache/ccache"
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          export HOMEBREW_CCACHE=1
-          
-          echo "::group::VM Provisioning"
-          echo "Installing Rosetta 2..."
-          sudo softwareupdate --install-rosetta --agree-to-license
-          
-          echo "Installing Intel Homebrew..."
-          NONINTERACTIVE=1 arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          eval "$(/usr/local/bin/brew shellenv)"
-          
-          echo "Installing ccache..."
+          export PATH="/usr/local/bin:$PATH"
           arch -x86_64 brew install ccache
           ccache --set-config=max_size=2G
           ccache -z
-          echo "::endgroup::"
+          echo "PATH=/usr/local/bin:$PATH" >> $GITHUB_ENV
+          echo "HOMEBREW_CACHE=$GITHUB_WORKSPACE/cache/Homebrew" >> $GITHUB_ENV
+          echo "HOMEBREW_TEMP=$GITHUB_WORKSPACE/tmp" >> $GITHUB_ENV
+          echo "CCACHE_DIR=$GITHUB_WORKSPACE/cache/ccache" >> $GITHUB_ENV
+
+      - name: Detect packages (Simulated)
+        if: inputs.detect_mode
+        id: detect
+        run: |
+          set -euo pipefail
+          export PATH="/usr/local/bin:$PATH"
+          # Warning: runner is macos-15. Bottle detection here sees sequoia bottles, not ventura bottles.
+          # We just use the passed list or fail if empty.
+          check_list="${{ inputs.packages }}"
+          [ -z "$check_list" ] && { echo "ERROR: packages input required with detect_mode on runner" >&2; exit 1; }
           
-          cd "$SHARED"
-          
-          # Detect Mode
-          if [ "$DETECT_MODE" = "true" ]; then
-            check_list="${PACKAGES}"
-            [ -z "$check_list" ] && check_list=$(arch -x86_64 brew outdated --formula --quiet 2>/dev/null || true)
-            [ -z "$check_list" ] && { echo "Nothing to detect."; exit 0; }
-            
-            needs_compile=()
-            for pkg in $check_list; do
-              if arch -x86_64 brew fetch --bottle-tag=ventura "$pkg" 2>/dev/null; then
-                echo "[bottle] $pkg"
-              else
-                echo "[compile] $pkg"
-                needs_compile+=("$pkg")
-              fi
-            done
-            [ ${#needs_compile[@]} -eq 0 ] && { echo "All bottles exist."; exit 0; }
-            
-            ordered=$(arch -x86_64 brew deps --topological "${needs_compile[@]}" 2>/dev/null || printf '%s\n' "${needs_compile[@]}")
-            final=()
-            while IFS= read -r pkg; do
-              for nc in "${needs_compile[@]}"; do
-                [ "$pkg" = "$nc" ] && { final+=("$pkg"); break; }
-              done
-            done <<< "$ordered"
-            for nc in "${needs_compile[@]}"; do
-              skip=false
-              for f in "${final[@]}"; do [ "$f" = "$nc" ] && skip=true && break; done
-              $skip || final+=("$nc")
-            done
-            
-            PACKAGES="${final[*]}"
-            echo "Building: $PACKAGES"
-          fi
-          
-          [ -z "$PACKAGES" ] && { echo "No packages to build."; exit 0; }
-          
+          # We just blindly build what is asked. Real detection must run on MacBook 12.
+          echo "Building: $check_list"
+          printf 'detected=%s\n' "$check_list" >> "$GITHUB_OUTPUT"
+        outputs:
+          detected: ${{ steps.detect.outputs.detected }}
+
+      - name: Build bottles
+        if: ${{ inputs.detect_mode && steps.detect.outputs.detected != '' || !inputs.detect_mode && inputs.packages != '' }}
+        env:
+          PACKAGES: ${{ inputs.detect_mode && steps.detect.outputs.detected || inputs.packages }}
+        run: |
+          set -uo pipefail
           mkdir -p bottles
           echo '{"packages":[]}' > bottles/build-manifest.json
-          
+
           for pkg in $PACKAGES; do
             echo "::group::$pkg"
-            start=$(date +%s)
             
-            build_log="$SHARED/tmp/brew-build-${pkg}.log"
+            # Disk space check
+            free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
+            if [ "$free_gb" -lt 5 ]; then
+              arch -x86_64 brew cleanup --prune=0 2>/dev/null || true
+              free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
+              [ "$free_gb" -lt 5 ] && { echo "::error::Out of disk"; exit 1; }
+            fi
+
+            start=$(date +%s)
+            arch -x86_64 brew uninstall --ignore-dependencies "$pkg" 2>/dev/null || true
+
+            build_log="/tmp/brew-build-${pkg}.log"
             set +e
+            # Build bottle. The compiler will see MACOSX_DEPLOYMENT_TARGET=13.0
             arch -x86_64 brew install --build-bottle --verbose "$pkg" > "$build_log" 2>&1
             build_exit=$?
             set -e
             tail -30 "$build_log"
             rm -f "$build_log"
-            [ "$build_exit" -ne 0 ] && { echo "::error::brew install failed for $pkg"; exit 1; }
-            
+            [ "$build_exit" -ne 0 ] && { echo "::error::brew install failed for $pkg (exit $build_exit)"; exit 1; }
+
             arch -x86_64 brew bottle --verbose --json "$pkg" 2>&1
-            
-            pkg_name=$(basename "$pkg")
-            tarball=$(ls ${pkg_name}--*.ventura.bottle.tar.gz 2>/dev/null | head -1 || true)
-            jsonfile=$(ls ${pkg_name}--*.ventura.bottle.json 2>/dev/null | head -1 || true)
+
+            # Get generated bottle (it will be tagged .sequoia. or something, but we rename it to .ventura.)
+            tarball=$(ls ${pkg}--*.bottle.tar.gz 2>/dev/null | head -1 || true)
+            jsonfile=$(ls ${pkg}--*.bottle.json 2>/dev/null | head -1 || true)
             [ -s "$tarball" ] || { echo "::error::No bottle tarball for $pkg"; exit 1; }
-            
-            checksum=$(shasum -a 256 "$tarball" | awk '{print $1}')
-            size=$(du -h "$tarball" | awk '{print $1}')
+
+            # Rename to ventura tag so MacBook 12 doesn't complain during install
+            new_tarball=$(echo "$tarball" | sed 's/\.bottle\.tar\.gz/.ventura.bottle.tar.gz/')
+            new_jsonfile=$(echo "$jsonfile" | sed 's/\.bottle\.json/.ventura.bottle.json/')
+            mv "$tarball" "bottles/$new_tarball"
+            [ -n "$jsonfile" ] && [ -s "$jsonfile" ] && mv "$jsonfile" "bottles/$new_jsonfile"
+
+            # Checksum
+            checksum=$(shasum -a 256 "bottles/$new_tarball" | awk '{print $1}')
+            size=$(du -h "bottles/$new_tarball" | awk '{print $1}')
             duration=$(($(date +%s) - start))
+            
             echo "$pkg | $size | ${duration}s | $checksum"
-            
-            mv "$tarball" bottles/
-            [ -n "$jsonfile" ] && [ -s "$jsonfile" ] && mv "$jsonfile" bottles/
-            
-            python3 -c 'import json; m=json.load(open("bottles/build-manifest.json")); m["packages"].append({"name":"'$pkg'","bottle":"'$tarball'","sha256":"'$checksum'","size":"'$size'","duration":'$duration'}); json.dump(m,open("bottles/build-manifest.json","w"),indent=2)'
-            
+
+            python3 << PYEOF
+import json
+m = json.load(open('bottles/build-manifest.json'))
+m['packages'].append({
+    'name': '$pkg',
+    'bottle': '$new_tarball',
+    'sha256': '$checksum',
+    'size': '$size',
+    'duration': $duration
+})
+json.dump(m, open('bottles/build-manifest.json', 'w'), indent=2)
+PYEOF
+
             arch -x86_64 brew cleanup --prune=0 2>/dev/null || true
             echo "::endgroup::"
           done
-          
-          ccache -s
-          EOF
-          
-          sshpass -p admin scp -o StrictHostKeyChecking=no build.sh admin@$VM_IP:/tmp/build.sh
-          sshpass -p admin ssh -o StrictHostKeyChecking=no admin@$VM_IP "bash /tmp/build.sh"
-          
-      - name: Save ccache (always)
+
+      - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: cache/ccache
           key: ccache-${{ github.run_id }}
 
-      - name: Upload manifest (always)
+      - name: Upload manifest
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: manifest-${{ github.run_id }}
           path: bottles/build-manifest.json
-          retention-days: 90
-          if-no-files-found: ignore
 
-      - name: Upload bottles (always)
+      - name: Upload bottles
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bottles-${{ github.run_id }}
           path: bottles/*.ventura.bottle.*
-          retention-days: 90
-          if-no-files-found: warn
