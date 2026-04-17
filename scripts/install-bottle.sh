@@ -1,6 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 # Usage: install-bottle.sh <run_id> <package_name> [repo]
+#
+# Installs a forged Ventura bottle using native `brew install`.
+# Requires: HOMEBREW_DEVELOPER=1 to bypass local-path restriction,
+#           --force-bottle to accept cross-OS bottles.
 
 RUN_ID="${1:?Usage: install-bottle.sh <run_id> <package_name>}"
 PKG_NAME="${2:?Usage: install-bottle.sh <run_id> <package_name>}"
@@ -14,7 +18,7 @@ echo "=== Installing forged bottle for $PKG_NAME from run $RUN_ID ==="
 echo "Downloading artifact: $ARTIFACT_NAME"
 
 if ! gh run download "$RUN_ID" -R "$REPO" -n "$ARTIFACT_NAME" -D "$D"; then
-    echo "::error::Failed to download artifact '$ARTIFACT_NAME'. Please check if the run ID and package name are correct."
+    echo "::error::Failed to download artifact '$ARTIFACT_NAME'."
     exit 1
 fi
 
@@ -28,24 +32,14 @@ fi
 BOTTLE_PATH="${bottle_file[0]}"
 echo "Found bottle: $(basename "$BOTTLE_PATH")"
 
-echo "Attempting to install via Plan B (manual extraction)..."
-cellar_dir=$(brew --cellar)
-if [ ! -d "$cellar_dir" ]; then
-    echo "::error::Homebrew Cellar not found at '$cellar_dir'"
-    exit 1
-fi
-
-echo "Extracting to $cellar_dir"
-tar -xzf "$BOTTLE_PATH" -C "$cellar_dir"
-
-pkg_dir_in_cellar=$(basename "$BOTTLE_PATH" | sed -e 's/\.ventura\.bottle.*//' -e 's/--/ /' | awk '{print $1}')
-echo "Linking '$pkg_dir_in_cellar'..."
-
-if brew link --overwrite "$pkg_dir_in_cellar"; then
-    echo "✅ Success! '$PKG_NAME' installed via manual extraction."
-    echo "Pinning package to prevent accidental upgrades..."
-    brew pin "$PKG_NAME"
+echo "Installing via native brew install (HOMEBREW_DEVELOPER=1 + --force-bottle)..."
+if HOMEBREW_DEVELOPER=1 brew install --force-bottle "$BOTTLE_PATH"; then
+    echo "✅ Success! '$PKG_NAME' installed via native brew install."
 else
-    echo "❌ FAILED to link the package."
-    exit 1
+    echo "❌ brew install failed. Falling back to manual extraction..."
+    cellar_dir=$(brew --cellar)
+    tar -xpf "$BOTTLE_PATH" -C "$cellar_dir"
+    brew link --overwrite "$PKG_NAME"
+    brew pin "$PKG_NAME"
+    echo "✅ Installed via fallback (manual extraction + pin)."
 fi
