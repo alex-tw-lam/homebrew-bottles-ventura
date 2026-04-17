@@ -100,8 +100,9 @@ jobs:
           #    CRITICAL: Must pack pkg/version/ directly (NOT ./ or pkg/ alone)
           #    Homebrew's resolve_formula_names() and resolve_version() parse
           #    the FIRST tar entry as "name/version/" — any ./ prefix breaks it.
-          pkg_dir=$(ls -d bottle_temp/*/)
-          COPYFILE_DISABLE=1 tar -czpf "$VENTURA_FILE" -C bottle_temp "${pkg_dir#bottle_temp/}"
+          # Find the pkg/version/ directory inside the extracted bottle
+          pkg_version_dir=$(find bottle_temp -mindepth 2 -maxdepth 2 -type d | head -1)
+          COPYFILE_DISABLE=1 tar -czpf "$VENTURA_FILE" -C bottle_temp "${pkg_version_dir#bottle_temp/}"
 
           # 4. Cleanup
           rm "$BOTTLE_FILE"
