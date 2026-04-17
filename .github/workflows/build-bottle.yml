@@ -1,150 +1,118 @@
-name: Build Homebrew Bottles (macos-15-intel)
+name: Build and Forge Homebrew Bottle
 
 on:
   workflow_dispatch:
     inputs:
-      packages:
-        description: 'Package names in topological order'
+      package:
+        description: 'The single package name to build'
         required: true
         type: string
 
 permissions:
   contents: read
-  actions: write
-
-env:
-  HOMEBREW_NO_AUTO_UPDATE: "1"
-  HOMEBREW_CCACHE: "1"
 
 jobs:
-  build:
+  build_and_forge:
     runs-on: macos-15-intel
-    timeout-minutes: 360
+    timeout-minutes: 60
+    
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_CCACHE: "1"
+      # Force targeting macOS 13 (Ventura)
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+      CFLAGS: "-target x86_64-apple-macos13.0"
+      CXXFLAGS: "-target x86_64-apple-macos13.0"
+      LDFLAGS: "-target x86_64-apple-macos13.0"
+      
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Validate inputs
-        if: ${{ inputs.packages == '' }}
-        run: |
-          echo "::error::No packages specified."
-          exit 1
-
-      - name: Setup Homebrew
+      - name: Setup Homebrew and ccache
         run: |
           echo "Ensuring Homebrew is ready..."
-          # Force tap homebrew/core because 'brew bottle' requires git metadata
           brew tap homebrew/core
-
-      - name: Setup cache directories
-        run: |
-          mkdir -p cache/ccache bottles tmp
-
-      - name: Cache Homebrew downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/Homebrew
-          key: brew-dl-${{ github.run_id }}
-          restore-keys: brew-dl-
+          brew install ccache
+          ccache --set-config=max_size=2G
+          ccache -z
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
-          path: cache/ccache
+          path: ~/.ccache
           key: ccache-${{ github.run_id }}
           restore-keys: ccache-
 
-      - name: Setup ccache and Paths
+      - name: Build and Bottle Package
+        id: build
         run: |
-          export PATH="/usr/local/bin:$PATH"
-          brew install ccache
-          ccache --set-config=max_size=2G
-          ccache -z
-          echo "PATH=/usr/local/bin:$PATH" >> $GITHUB_ENV
-          echo "HOMEBREW_TEMP=$GITHUB_WORKSPACE/tmp" >> $GITHUB_ENV
-          echo "CCACHE_DIR=$GITHUB_WORKSPACE/cache/ccache" >> $GITHUB_ENV
+          set -euo pipefail
+          pkg="${{ inputs.package }}"
+          echo "Building bottle for $pkg..."
+          
+          brew uninstall --ignore-dependencies "$pkg" 2>/dev/null || true
+          brew install --build-bottle --verbose "$pkg"
+          brew bottle --verbose --json "$pkg"
 
-      - name: Build bottles
-        env:
-          PACKAGES: ${{ inputs.packages }}
-          # Force targeting macOS 13
-          MACOSX_DEPLOYMENT_TARGET: "13.0"
-          CFLAGS: "-target x86_64-apple-macos13.0"
-          CXXFLAGS: "-target x86_64-apple-macos13.0"
-          LDFLAGS: "-target x86_64-apple-macos13.0"
+          bottle_file=$(find . -name "${pkg}--*.bottle*.tar.gz" | head -n 1)
+          if [ -z "$bottle_file" ]; then
+            echo "::error::No bottle file was generated for $pkg"
+            exit 1
+          fi
+          echo "Generated original bottle: $bottle_file"
+          echo "bottle_file=$(basename $bottle_file)" >> $GITHUB_OUTPUT
+
+      - name: Forge Ventura Bottle (狸貓換太子)
+        id: forge
+        if: steps.build.outputs.bottle_file != ''
         run: |
-          set -uo pipefail
-          mkdir -p bottles
-          echo '{"packages":[]}' > bottles/build-manifest.json
+          set -euo pipefail
+          BOTTLE_FILE="${{ steps.build.outputs.bottle_file }}"
+          VENTURA_FILE="${BOTTLE_FILE//sequoia/ventura}"
 
-          for pkg in $PACKAGES; do
-            echo "::group::$pkg"
-            
-            # Disk space check
-            free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
-            if [ "$free_gb" -lt 5 ]; then
-              brew cleanup --prune=0 2>/dev/null || true
-              free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
-              [ "$free_gb" -lt 5 ] && { echo "::error::Out of disk"; exit 1; }
-            fi
+          echo "Forging: $BOTTLE_FILE -> $VENTURA_FILE"
 
-            start=$(date +%s)
-            brew uninstall --ignore-dependencies "$pkg" 2>/dev/null || true
+          # 1. Unpack
+          mkdir bottle_temp
+          tar -xzf "$BOTTLE_FILE" -C bottle_temp
 
-            build_log="/tmp/brew-build-${pkg}.log"
-            set +e
-            brew install --build-bottle --verbose "$pkg" > "$build_log" 2>&1
-            build_exit=$?
-            set -e
-            tail -30 "$build_log"
-            rm -f "$build_log"
-            [ "$build_exit" -ne 0 ] && { echo "::error::brew install failed for $pkg (exit $build_exit)"; exit 1; }
+          # 2. Modify INSTALL_RECEIPT.json
+          receipt_file=$(find bottle_temp -name "INSTALL_RECEIPT.json")
+          if [ -z "$receipt_file" ]; then
+            echo "::error::Could not find INSTALL_RECEIPT.json in bottle!"
+            exit 1
+          fi
+          
+          echo "Original Metadata:"
+          cat "$receipt_file" | grep -E 'sequoia|"os_version"'
 
-            brew bottle --verbose --json "$pkg" 2>&1
+          sed -i '' 's/sequoia/ventura/g' "$receipt_file"
+          sed -i '' 's/"os_version": "macOS 15\.[0-9.]*"/"os_version": "macOS 13.0"/' "$receipt_file"
+          
+          echo "Forged Metadata:"
+          cat "$receipt_file" | grep -E 'ventura|"os_version"'
 
-            tarball=$(find . -name "${pkg}--*.bottle*.tar.gz" | head -n 1)
-            jsonfile=$(find . -name "${pkg}--*.bottle*.json" | head -n 1)
-            [ -s "$tarball" ] || { echo "::error::No bottle tarball for $pkg"; exit 1; }
+          # 3. Repack
+          (cd bottle_temp && tar -czf "../$VENTURA_FILE" .)
 
-            # Rename to ventura tag so it's clear what OS it targets
-            new_tarball="bottles/$(basename "$tarball" | sed 's/\(\.bottle\..*\.tar\.gz\)/.ventura\1/')"
-            mv "$tarball" "$new_tarball"
-
-            if [ -n "$jsonfile" ] && [ -s "$jsonfile" ]; then
-                new_jsonfile="bottles/$(basename "$jsonfile" | sed 's/\(\.bottle\..*\.json\)/.ventura\1/')"
-                mv "$jsonfile" "$new_jsonfile"
-            fi
-
-            # Checksum
-            checksum=$(shasum -a 256 "bottles/$new_tarball" | awk '{print $1}')
-            size=$(du -h "bottles/$new_tarball" | awk '{print $1}')
-            duration=$(($(date +%s) - start))
-            
-            echo "$pkg | $size | ${duration}s | $checksum"
-
-            python3 -c 'import json; m=json.load(open("bottles/build-manifest.json")); m["packages"].append({"name":"'$pkg'","bottle":"'$new_tarball'","sha256":"'$checksum'","size":"'$size'","duration":'$duration'}); json.dump(m,open("bottles/build-manifest.json","w"),indent=2)'
-
-            brew cleanup --prune=0 2>/dev/null || true
-            echo "::endgroup::"
-          done
+          # 4. Cleanup
+          rm "$BOTTLE_FILE"
+          rm -rf bottle_temp
+          
+          echo "forged_bottle_file=$VENTURA_FILE" >> $GITHUB_OUTPUT
 
       - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: cache/ccache
+          path: ~/.ccache
           key: ccache-${{ github.run_id }}
 
-      - name: Upload manifest
-        if: always()
+      - name: Upload Forged Bottle
+        if: steps.forge.outputs.forged_bottle_file != ''
         uses: actions/upload-artifact@v4
         with:
-          name: manifest-${{ github.run_id }}
-          path: bottles/build-manifest.json
-
-      - name: Upload bottles
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bottles-${{ github.run_id }}
-          path: bottles/*.ventura.bottle.tar.gz
+          name: forged-bottle-${{ inputs.package }}-${{ github.run_id }}
+          path: ${{ steps.forge.outputs.forged_bottle_file }}
