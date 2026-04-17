@@ -28,12 +28,24 @@ fi
 BOTTLE_PATH="${bottle_file[0]}"
 echo "Found bottle: $(basename "$BOTTLE_PATH")"
 
-echo "Attempting to install with 'brew install'..."
-if brew install "$BOTTLE_PATH"; then
-    echo "✅ Success! '$PKG_NAME' installed using the forged bottle."
+echo "Attempting to install via Plan B (manual extraction)..."
+cellar_dir=$(brew --cellar)
+if [ ! -d "$cellar_dir" ]; then
+    echo "::error::Homebrew Cellar not found at '$cellar_dir'"
+    exit 1
+fi
+
+echo "Extracting to $cellar_dir"
+tar -xzf "$BOTTLE_PATH" -C "$cellar_dir"
+
+pkg_dir_in_cellar=$(basename "$BOTTLE_PATH" | sed -e 's/\.ventura\.bottle.*//' -e 's/--/ /' | awk '{print $1}')
+echo "Linking '$pkg_dir_in_cellar'..."
+
+if brew link --overwrite "$pkg_dir_in_cellar"; then
+    echo "✅ Success! '$PKG_NAME' installed via manual extraction."
     echo "Pinning package to prevent accidental upgrades..."
     brew pin "$PKG_NAME"
 else
-    echo "❌ FAILED. Even the forged bottle could not be installed."
+    echo "❌ FAILED to link the package."
     exit 1
 fi
