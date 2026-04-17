@@ -39,8 +39,15 @@ fi
 # Install each bottle
 for b in "${bottles[@]}"; do
   name=$(basename "$b" | sed 's/--.*//')
-  echo "Installing $name..."
-  if brew install "$b"; then
+  echo "Installing $name via manual extraction..."
+  
+  # Option 2: Extract directly to Cellar
+  cellar_dir=$(brew --cellar)
+  tar -xzf "$b" -C "$cellar_dir"
+  
+  # The tarball extracts into <package_name>/<version> directory.
+  # Link it manually
+  if brew link "$name"; then
     ver=$(brew info --json=v2 "$name" 2>/dev/null | python3 -c "
 import sys, json
 try:
@@ -51,7 +58,7 @@ except Exception:
 " 2>/dev/null || echo "?")
     echo "  OK: $name @ $ver"
   else
-    echo "  FAILED: $name"
+    echo "  FAILED to link: $name"
     exit 1
   fi
 done
