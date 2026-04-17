@@ -1,0 +1,209 @@
+name: Build Homebrew Bottles
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: 'Package names in topological order (required when detect_mode=false)'
+        required: false
+        type: string
+      detect_mode:
+        description: 'Auto-detect which of the listed packages need ventura compilation'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_CCACHE: "1"
+
+jobs:
+  build:
+    runs-on: macos-13
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Switch to Command Line Tools
+        run: sudo xcode-select -s /Library/Developer/CommandLineTools
+
+      - name: Validate environment (V3)
+        run: |
+          brew --version
+          clang --version
+          if ! xcode-select -p | grep -q "CommandLineTools"; then
+            echo "::error::Wrong developer directory: $(xcode-select -p)"
+            exit 1
+          fi
+
+      - name: Cache Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-dl-${{ github.run_id }}
+          restore-keys: brew-dl-
+
+      - name: Setup ccache
+        run: |
+          brew install ccache 2>/dev/null || true
+          ccache --set-config=max_size=2G
+          ccache -z
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      - name: Validate inputs
+        if: ${{ !inputs.detect_mode && inputs.packages == '' }}
+        run: |
+          echo "::error::No packages specified. Use -f packages='...' or -f detect_mode=true"
+          exit 1
+
+      - name: Detect packages needing compilation
+        if: inputs.detect_mode
+        id: detect
+        run: |
+          set -euo pipefail
+          check_list="${{ inputs.packages }}"
+          [ -z "$check_list" ] && { echo "ERROR: packages input required with detect_mode" >&2; exit 1; }
+
+          needs_compile=()
+          for pkg in $check_list; do
+            if brew fetch --bottle-tag=ventura "$pkg" 2>/dev/null; then
+              echo "[bottle] $pkg"
+            else
+              echo "[compile] $pkg"
+              needs_compile+=("$pkg")
+            fi
+          done
+
+          [ ${#needs_compile[@]} -eq 0 ] && { echo "detected=" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          # Topological sort: deps first
+          ordered=$(brew deps --topological "${needs_compile[@]}" 2>/dev/null || printf '%s\n' "${needs_compile[@]}")
+          # Keep only packages needing compilation, in correct order
+          final=()
+          while IFS= read -r pkg; do
+            for nc in "${needs_compile[@]}"; do
+              [ "$pkg" = "$nc" ] && { final+=("$pkg"); break; }
+            done
+          done <<< "$ordered"
+          for nc in "${needs_compile[@]}"; do
+            skip=false
+            for f in "${final[@]}"; do [ "$f" = "$nc" ] && skip=true && break; done
+            $skip || final+=("$nc")
+          done
+
+          echo "Building: ${final[*]}"
+          printf 'detected=%s\n' "$(printf '%s ' "${final[@]}")" >> "$GITHUB_OUTPUT"
+        outputs:
+          detected: ${{ steps.detect.outputs.detected }}
+
+      - name: Build bottles
+        if: inputs.detect_mode && steps.detect.outputs.detected != '' || !inputs.detect_mode && inputs.packages != ''
+        env:
+          PACKAGES: ${{ inputs.detect_mode && steps.detect.outputs.detected || inputs.packages }}
+        run: |
+          set -uo pipefail
+          mkdir -p bottles
+          echo '{"packages":[]}' > bottles/build-manifest.json
+
+          for pkg in $PACKAGES; do
+            echo "::group::$pkg"
+
+            # V11: Disk space
+            free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
+            echo "Disk: ${free_gb}GB free"
+            if [ "$free_gb" -lt 5 ]; then
+              brew cleanup --prune=0 2>/dev/null || true
+              free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
+              [ "$free_gb" -lt 5 ] && { echo "::error::Out of disk"; exit 1; }
+            fi
+
+            start=$(date +%s)
+
+            # Build — write to log file to avoid 10min GitHub Actions timeout
+            # (piping to tail suppresses output, causing auto-kill)
+            # Ensure package not already installed from previous run
+            brew uninstall --ignore-dependencies "$pkg" 2>/dev/null || true
+
+            build_log="/tmp/brew-build-${pkg}.log"
+            set +e
+            brew install --build-bottle --verbose "$pkg" > "$build_log" 2>&1
+            build_exit=$?
+            set -e
+            tail -30 "$build_log"
+            rm -f "$build_log"
+            [ "$build_exit" -ne 0 ] && { echo "::error::brew install failed for $pkg (exit $build_exit)"; exit 1; }
+
+            # Bottle
+            brew bottle --verbose --json "$pkg" 2>&1
+
+            # V5: Verify files exist
+            tarball=$(ls ${pkg}--*.ventura.bottle.tar.gz 2>/dev/null | head -1 || true)
+            jsonfile=$(ls ${pkg}--*.ventura.bottle.json 2>/dev/null | head -1 || true)
+            [ -s "$tarball" ] || { echo "::error::No bottle tarball for $pkg"; exit 1; }
+
+            # V6a: Checksum
+            checksum=$(shasum -a 256 "$tarball" | awk '{print $1}')
+            size=$(du -h "$tarball" | awk '{print $1}')
+            duration=$(($(date +%s) - start))
+            echo "$pkg | $size | ${duration}s | $checksum"
+
+            mv "$tarball" bottles/
+            [ -n "$jsonfile" ] && [ -s "$jsonfile" ] && mv "$jsonfile" bottles/
+
+            # Update manifest
+            python3 << PYEOF
+import json
+m = json.load(open('bottles/build-manifest.json'))
+m['packages'].append({
+    'name': '$pkg',
+    'bottle': '$tarball',
+    'sha256': '$checksum',
+    'size': '$size',
+    'duration': $duration
+})
+json.dump(m, open('bottles/build-manifest.json', 'w'), indent=2)
+PYEOF
+
+            brew cleanup --prune=0 2>/dev/null || true
+            echo "::endgroup::"
+          done
+
+          ccache -s
+          echo "=== Manifest ==="
+          cat bottles/build-manifest.json
+
+      - name: Save ccache (always)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.run_id }}
+
+      - name: Upload manifest (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ github.run_id }}
+          path: bottles/build-manifest.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload bottles (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottles-${{ github.run_id }}
+          path: bottles/*.ventura.bottle.*
+          retention-days: 90
+          if-no-files-found: warn
