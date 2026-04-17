@@ -1,0 +1,41 @@
+name: Test Forged Bottle Installation
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'The Run ID of the build that produced the forged bottle'
+        required: true
+      package_name:
+        description: 'The name of the package to test'
+        required: true
+
+jobs:
+  test_install:
+    runs-on: macos-15-intel # We test on a clean intel runner
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Homebrew
+        run: |
+          echo "Ensuring Homebrew is ready..."
+          brew tap homebrew/core
+
+      - name: Run Install Script
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/install-bottle.sh ${{ inputs.build_run_id }} ${{ inputs.package_name }}
+          
+      - name: Verify Installation
+        run: |
+          echo "Verifying that '${{ inputs.package_name }}' is installed and executable..."
+          if ! command -v ${{ inputs.package_name }} &> /dev/null; then
+            echo "::error::'${{ inputs.package_name }}' command not found after installation!"
+            exit 1
+          fi
+          
+          ${{ inputs.package_name }} --version
+          
+          echo "✅ Verification successful!"
