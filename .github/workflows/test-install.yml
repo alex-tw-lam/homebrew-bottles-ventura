@@ -18,12 +18,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Simulating old macOS environment..."
-          # Tell Homebrew to ignore OS requirements during install to simulate what we hope happens
-          export HOMEBREW_DEVELOPER=1
+          set -euo pipefail
+          echo "Simulating MacBook 12 manual install..."
+          export GH_TOKEN=${{ github.token }}
           
-          # Run the installer script with the provided run ID
+          # Run the installer script. It should use Plan B.
           ./scripts/install-bottles.sh ${{ inputs.run_id }} alex-tw-lam/homebrew-bottles-ventura
           
           echo "Verifying installation..."
+          if ! command -v tree &> /dev/null; then
+            echo "::error::'tree' command not found after installation!"
+            exit 1
+          fi
+          
           tree --version
+          
+          echo "OK: 'tree' is installed and executable."
