@@ -1,4 +1,4 @@
-name: Build Homebrew Bottles
+name: Build Homebrew Bottles (Tart VM)
 
 on:
   workflow_dispatch:
@@ -17,49 +17,13 @@ permissions:
   contents: read
   actions: write
 
-env:
-  HOMEBREW_NO_AUTO_UPDATE: "1"
-  HOMEBREW_CCACHE: "1"
-
 jobs:
   build:
-    runs-on: macos-13
+    runs-on: macos-14
     timeout-minutes: 360
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
-      - name: Switch to Command Line Tools
-        run: sudo xcode-select -s /Library/Developer/CommandLineTools
-
-      - name: Validate environment (V3)
-        run: |
-          brew --version
-          clang --version
-          if ! xcode-select -p | grep -q "CommandLineTools"; then
-            echo "::error::Wrong developer directory: $(xcode-select -p)"
-            exit 1
-          fi
-
-      - name: Cache Homebrew downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/Homebrew
-          key: brew-dl-${{ github.run_id }}
-          restore-keys: brew-dl-
-
-      - name: Setup ccache
-        run: |
-          brew install ccache 2>/dev/null || true
-          ccache --set-config=max_size=2G
-          ccache -z
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ github.run_id }}
-          restore-keys: ccache-
 
       - name: Validate inputs
         if: ${{ !inputs.detect_mode && inputs.packages == '' }}
@@ -67,104 +31,171 @@ jobs:
           echo "::error::No packages specified. Use -f packages='...' or -f detect_mode=true"
           exit 1
 
-      - name: Detect packages needing compilation
-        if: inputs.detect_mode
-        id: detect
+      - name: Install Tart & SSH Tools
         run: |
-          set -euo pipefail
-          check_list="${{ inputs.packages }}"
-          [ -z "$check_list" ] && { echo "ERROR: packages input required with detect_mode" >&2; exit 1; }
+          brew install cirruslabs/cli/tart sshpass
+          mkdir -p cache/Homebrew cache/ccache bottles tmp
 
-          needs_compile=()
-          for pkg in $check_list; do
-            if brew fetch --bottle-tag=ventura "$pkg" 2>/dev/null; then
-              echo "[bottle] $pkg"
-            else
-              echo "[compile] $pkg"
-              needs_compile+=("$pkg")
-            fi
-          done
+      - name: Cache Homebrew downloads (Host)
+        uses: actions/cache@v4
+        with:
+          path: cache/Homebrew
+          key: brew-dl-${{ github.run_id }}
+          restore-keys: brew-dl-
 
-          [ ${#needs_compile[@]} -eq 0 ] && { echo "detected=" >> "$GITHUB_OUTPUT"; exit 0; }
+      - name: Cache ccache (Host)
+        uses: actions/cache@v4
+        with:
+          path: cache/ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
 
-          ordered=$(brew deps --topological "${needs_compile[@]}" 2>/dev/null || printf '%s\n' "${needs_compile[@]}")
-          final=()
-          while IFS= read -r pkg; do
-            for nc in "${needs_compile[@]}"; do
-              [ "$pkg" = "$nc" ] && { final+=("$pkg"); break; }
-            done
-          done <<< "$ordered"
-          for nc in "${needs_compile[@]}"; do
-            skip=false
-            for f in "${final[@]}"; do [ "$f" = "$nc" ] && skip=true && break; done
-            $skip || final+=("$nc")
-          done
+      - name: Pull and clone macOS Ventura VM
+        run: |
+          IMAGE="ghcr.io/cirruslabs/macos-ventura-base:latest"
+          tart pull $IMAGE
+          tart clone $IMAGE ventura-vm
 
-          echo "Building: ${final[*]}"
-          printf 'detected=%s\n' "$(printf '%s ' "${final[@]}")" >> "$GITHUB_OUTPUT"
+      - name: Start Tart VM and Wait for SSH
+        run: |
+          tart run --dir=workspace:${{ github.workspace }} --no-graphics ventura-vm &
+          
+          echo "Waiting for VM IP..."
+          while [ -z "$(tart ip ventura-vm 2>/dev/null)" ]; do sleep 2; done
+          VM_IP=$(tart ip ventura-vm)
+          echo "VM_IP=$VM_IP" >> $GITHUB_ENV
+          
+          echo "Waiting for SSH to become available..."
+          while ! nc -z $VM_IP 22; do sleep 5; done
+          echo "VM is up and SSH is ready!"
 
-      - name: Build bottles
-        if: inputs.detect_mode && steps.detect.outputs.detected != '' || !inputs.detect_mode && inputs.packages != ''
+      - name: Execute Build inside VM
         env:
-          PACKAGES: ${{ inputs.detect_mode && steps.detect.outputs.detected || inputs.packages }}
+          PACKAGES: ${{ inputs.packages }}
+          DETECT_MODE: ${{ inputs.detect_mode }}
         run: |
-          set -uo pipefail
+          cat << 'EOF' > build.sh
+          #!/bin/bash
+          set -euo pipefail
+          
+          SHARED="/Volumes/My Shared Files/workspace"
+          export HOMEBREW_CACHE="$SHARED/cache/Homebrew"
+          # DO NOT export HOMEBREW_TEMP to shared disk (VirtioFS IO overhead is too slow for compiles)
+          export CCACHE_DIR="$SHARED/cache/ccache"
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_CCACHE=1
+          
+          echo "::group::VM Provisioning"
+          echo "Installing Rosetta 2..."
+          sudo softwareupdate --install-rosetta --agree-to-license
+          
+          echo "Installing Intel Homebrew..."
+          NONINTERACTIVE=1 arch -x86_64 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          eval "$(/usr/local/bin/brew shellenv)"
+          
+          echo "Installing ccache..."
+          arch -x86_64 brew install ccache
+          ccache --set-config=max_size=2G
+          ccache -z
+          echo "::endgroup::"
+          
+          cd "$SHARED"
+          
+          # Detect Mode
+          if [ "$DETECT_MODE" = "true" ]; then
+            check_list="${PACKAGES}"
+            [ -z "$check_list" ] && check_list=$(arch -x86_64 brew outdated --formula --quiet 2>/dev/null || true)
+            [ -z "$check_list" ] && { echo "Nothing to detect."; exit 0; }
+            
+            needs_compile=()
+            for pkg in $check_list; do
+              if arch -x86_64 brew fetch --bottle-tag=ventura "$pkg" 2>/dev/null; then
+                echo "[bottle] $pkg"
+              else
+                echo "[compile] $pkg"
+                needs_compile+=("$pkg")
+              fi
+            done
+            [ ${#needs_compile[@]} -eq 0 ] && { echo "All bottles exist."; exit 0; }
+            
+            ordered=$(arch -x86_64 brew deps --topological "${needs_compile[@]}" 2>/dev/null || printf '%s\n' "${needs_compile[@]}")
+            final=()
+            while IFS= read -r pkg; do
+              for nc in "${needs_compile[@]}"; do
+                [ "$pkg" = "$nc" ] && { final+=("$pkg"); break; }
+              done
+            done <<< "$ordered"
+            for nc in "${needs_compile[@]}"; do
+              skip=false
+              for f in "${final[@]}"; do [ "$f" = "$nc" ] && skip=true && break; done
+              $skip || final+=("$nc")
+            done
+            
+            PACKAGES="${final[*]}"
+            echo "Building: $PACKAGES"
+          fi
+          
+          [ -z "$PACKAGES" ] && { echo "No packages to build."; exit 0; }
+          
           mkdir -p bottles
           echo '{"packages":[]}' > bottles/build-manifest.json
-
+          
           for pkg in $PACKAGES; do
             echo "::group::$pkg"
-
-            free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
-            echo "Disk: ${free_gb}GB free"
-            if [ "$free_gb" -lt 5 ]; then
-              brew cleanup --prune=0 2>/dev/null || true
-              free_gb=$(($(df -k / | awk 'NR==2{print $4}') / 1024 / 1024))
-              [ "$free_gb" -lt 5 ] && { echo "::error::Out of disk"; exit 1; }
-            fi
-
             start=$(date +%s)
-
-            brew uninstall --ignore-dependencies "$pkg" 2>/dev/null || true
-
-            build_log="/tmp/brew-build-${pkg}.log"
+            
+            build_log="$SHARED/tmp/brew-build-${pkg}.log"
             set +e
-            brew install --build-bottle --verbose "$pkg" > "$build_log" 2>&1
+            arch -x86_64 brew install --build-bottle --verbose "$pkg" > "$build_log" 2>&1
             build_exit=$?
             set -e
             tail -30 "$build_log"
             rm -f "$build_log"
-            [ "$build_exit" -ne 0 ] && { echo "::error::brew install failed for $pkg (exit $build_exit)"; exit 1; }
-
-            brew bottle --verbose --json "$pkg" 2>&1
-
-            tarball=$(ls ${pkg}--*.ventura.bottle.tar.gz 2>/dev/null | head -1 || true)
-            jsonfile=$(ls ${pkg}--*.ventura.bottle.json 2>/dev/null | head -1 || true)
+            [ "$build_exit" -ne 0 ] && { echo "::error::brew install failed for $pkg"; exit 1; }
+            
+            arch -x86_64 brew bottle --verbose --json "$pkg" 2>&1
+            
+            pkg_name=$(basename "$pkg")
+            tarball=$(ls ${pkg_name}--*.ventura.bottle.tar.gz 2>/dev/null | head -1 || true)
+            jsonfile=$(ls ${pkg_name}--*.ventura.bottle.json 2>/dev/null | head -1 || true)
             [ -s "$tarball" ] || { echo "::error::No bottle tarball for $pkg"; exit 1; }
-
+            
             checksum=$(shasum -a 256 "$tarball" | awk '{print $1}')
             size=$(du -h "$tarball" | awk '{print $1}')
             duration=$(($(date +%s) - start))
             echo "$pkg | $size | ${duration}s | $checksum"
-
+            
             mv "$tarball" bottles/
             [ -n "$jsonfile" ] && [ -s "$jsonfile" ] && mv "$jsonfile" bottles/
-
-            python3 -c 'import json; m=json.load(open("bottles/build-manifest.json")); m["packages"].append({"name":"'$pkg'","bottle":"'$tarball'","sha256":"'$checksum'","size":"'$size'","duration":'$duration'}); json.dump(m,open("bottles/build-manifest.json","w"),indent=2)'
-
-            brew cleanup --prune=0 2>/dev/null || true
+            
+            python3 << PYEOF
+import json
+m = json.load(open('bottles/build-manifest.json'))
+m['packages'].append({
+    'name': '$pkg',
+    'bottle': '$tarball',
+    'sha256': '$checksum',
+    'size': '$size',
+    'duration': $duration
+})
+json.dump(m, open('bottles/build-manifest.json', 'w'), indent=2)
+PYEOF
+            
+            arch -x86_64 brew cleanup --prune=0 2>/dev/null || true
             echo "::endgroup::"
           done
-
+          
           ccache -s
-          echo "=== Manifest ==="
-          cat bottles/build-manifest.json
-
+          EOF
+          
+          sshpass -p admin scp -o StrictHostKeyChecking=no build.sh admin@$VM_IP:/tmp/build.sh
+          sshpass -p admin ssh -o StrictHostKeyChecking=no admin@$VM_IP "bash /tmp/build.sh"
+          
       - name: Save ccache (always)
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: ~/.ccache
+          path: cache/ccache
           key: ccache-${{ github.run_id }}
 
       - name: Upload manifest (always)
