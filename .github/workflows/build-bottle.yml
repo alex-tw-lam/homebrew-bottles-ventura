@@ -74,9 +74,9 @@ jobs:
 
           echo "Forging: $BOTTLE_FILE -> $VENTURA_FILE"
 
-          # 1. Unpack
+          # 1. Unpack (preserving permissions)
           mkdir bottle_temp
-          tar -xzf "$BOTTLE_FILE" -C bottle_temp
+          tar -xpf "$BOTTLE_FILE" -C bottle_temp
 
           # 2. Modify INSTALL_RECEIPT.json
           receipt_file=$(find bottle_temp -name "INSTALL_RECEIPT.json")
@@ -88,14 +88,16 @@ jobs:
           echo "Original Metadata:"
           cat "$receipt_file" | grep -E 'sequoia|"os_version"'
 
-          sed -i '' 's/sequoia/ventura/g' "$receipt_file"
-          sed -i '' 's/"os_version": "macOS 15\.[0-9.]*"/"os_version": "macOS 13.0"/' "$receipt_file"
+          sed -i.bak 's/sequoia/ventura/g' "$receipt_file"
+          # More robust sed to handle versions like 15.0 or 15.1.2
+          sed -i.bak 's/"os_version": "macOS 15[^"]*"/"os_version": "macOS 13.0"/' "$receipt_file"
+          rm "${receipt_file}.bak"
           
           echo "Forged Metadata:"
           cat "$receipt_file" | grep -E 'ventura|"os_version"'
 
-          # 3. Repack
-          (cd bottle_temp && tar -czf "../$VENTURA_FILE" .)
+          # 3. Repack (preserving permissions, avoiding macOS extended attributes)
+          (cd bottle_temp && COPYFILE_DISABLE=1 tar -czpf "../$VENTURA_FILE" .)
 
           # 4. Cleanup
           rm "$BOTTLE_FILE"
