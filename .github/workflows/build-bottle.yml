@@ -89,8 +89,6 @@ jobs:
           # We just blindly build what is asked. Real detection must run on MacBook 12.
           echo "Building: $check_list"
           printf 'detected=%s\n' "$check_list" >> "$GITHUB_OUTPUT"
-        outputs:
-          detected: ${{ steps.detect.outputs.detected }}
 
       - name: Build bottles
         if: ${{ inputs.detect_mode && steps.detect.outputs.detected != '' || !inputs.detect_mode && inputs.packages != '' }}
