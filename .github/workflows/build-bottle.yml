@@ -145,18 +145,7 @@ jobs:
             
             echo "$pkg | $size | ${duration}s | $checksum"
 
-            python3 << PYEOF
-import json
-m = json.load(open('bottles/build-manifest.json'))
-m['packages'].append({
-    'name': '$pkg',
-    'bottle': '$new_tarball',
-    'sha256': '$checksum',
-    'size': '$size',
-    'duration': $duration
-})
-json.dump(m, open('bottles/build-manifest.json', 'w'), indent=2)
-PYEOF
+            python3 -c 'import json; m=json.load(open("bottles/build-manifest.json")); m["packages"].append({"name":"'$pkg'","bottle":"'$new_tarball'","sha256":"'$checksum'","size":"'$size'","duration":'$duration'}); json.dump(m,open("bottles/build-manifest.json","w"),indent=2)'
 
             arch -x86_64 brew cleanup --prune=0 2>/dev/null || true
             echo "::endgroup::"
